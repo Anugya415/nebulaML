@@ -2,16 +2,19 @@
 Authentication routes for login, register, and user management
 """
 
-from fastapi import APIRouter, HTTPException, Depends, status
+import re
+
+from fastapi import APIRouter, HTTPException, Depends, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, field_validator
 from typing import Optional
 import mysql.connector
-from app.db.session import get_db_connection
+from app.db.session import get_db_connection, migrate_users_otp_columns
+from app.core.logging import logger
 from app.core.rbac import (
-    hash_password, 
-    verify_password, 
-    create_access_token, 
+    hash_password,
+    verify_password,
+    create_access_token,
     decode_access_token,
     Role,
     Permission,
@@ -19,22 +22,48 @@ from app.core.rbac import (
     get_role_permissions
 )
 import uuid
+import random
+from datetime import datetime, timedelta
+from app.core.email import send_otp_email
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+
+limiter = Limiter(key_func=get_remote_address)
 
 router = APIRouter()
 security = HTTPBearer()
+
+
+_USERNAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 
 # Pydantic models
 class UserRegister(BaseModel):
     username: str
     email: EmailStr
-    password: str
     role: Optional[str] = Role.USER
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Username cannot be empty")
+        if not _USERNAME_RE.match(v):
+            raise ValueError(
+                "Username may only contain lowercase letters, digits, and underscores"
+            )
+        return v
 
 
 class UserLogin(BaseModel):
-    username: str
-    password: str
+    email: str
+
+class UserVerify(BaseModel):
+    email: str
+    otp: str
+
+class EmailRequest(BaseModel):
+    email: EmailStr
 
 
 class UserResponse(BaseModel):
@@ -113,8 +142,9 @@ def require_permission(permission: str):
     return permission_checker
 
 
-@router.post("/register", response_model=TokenResponse)
-async def register(user_data: UserRegister):
+@router.post("/register")
+@limiter.limit("5/minute")
+async def register(request: Request, user_data: UserRegister):
     """Register a new user"""
     connection = get_db_connection()
     if not connection:
@@ -127,14 +157,14 @@ async def register(user_data: UserRegister):
         cursor = connection.cursor(dictionary=True)
         
         # Check if username exists
-        cursor.execute("SELECT id FROM users WHERE username = %s", (user_data.username,))
+        cursor.execute("SELECT id FROM users WHERE username = %s UNION SELECT id FROM pending_registrations WHERE username = %s", (user_data.username, user_data.username))
         if cursor.fetchone():
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Username already exists"
             )
         
-        # Check if email exists
+        # Check if email exists in users table
         cursor.execute("SELECT id FROM users WHERE email = %s", (user_data.email,))
         if cursor.fetchone():
             raise HTTPException(
@@ -142,42 +172,43 @@ async def register(user_data: UserRegister):
                 detail="Email already exists"
             )
         
-        # Hash password
-        hashed_password = hash_password(user_data.password)
+        # Generate OTP
+        otp_code = f"{random.randint(100000, 999999)}"
+        otp_expiry = datetime.now() + timedelta(minutes=10)
         
-        # Insert user
-        cursor.execute(
-            """
-            INSERT INTO users (username, email, password_hash, role)
-            VALUES (%s, %s, %s, %s)
-            """,
-            (user_data.username, user_data.email, hashed_password, user_data.role)
-        )
+        # Check if email exists in pending, update or insert
+        cursor.execute("SELECT id FROM pending_registrations WHERE email = %s", (user_data.email,))
+        pending_user = cursor.fetchone()
+        
+        if pending_user:
+            cursor.execute(
+                """
+                UPDATE pending_registrations 
+                SET username = %s, role = %s, verification_code = %s, verification_code_expires = %s
+                WHERE id = %s
+                """,
+                (user_data.username, user_data.role, otp_code, otp_expiry, pending_user['id'])
+            )
+        else:
+            cursor.execute(
+                """
+                INSERT INTO pending_registrations (username, email, role, verification_code, verification_code_expires)
+                VALUES (%s, %s, %s, %s, %s)
+                """,
+                (user_data.username, user_data.email, user_data.role, otp_code, otp_expiry)
+            )
         connection.commit()
-        
-        user_id = cursor.lastrowid
-        
-        # Get created user
-        cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        user = cursor.fetchone()
         
         cursor.close()
         connection.close()
         
-        # Create access token
-        access_token = create_access_token(
-            data={"user_id": user["id"], "username": user["username"], "role": user["role"]}
-        )
+        # Send Email
+        send_otp_email(user_data.email, otp_code)
         
+        # Return success message instead of token (since we need verify step)
         return {
-            "access_token": access_token,
-            "token_type": "bearer",
-            "user": {
-                "id": user["id"],
-                "username": user["username"],
-                "email": user["email"],
-                "role": user["role"]
-            }
+            "message": "OTP sent to email",
+            "email": user_data.email
         }
         
     except HTTPException:
@@ -189,9 +220,10 @@ async def register(user_data: UserRegister):
         )
 
 
-@router.post("/login", response_model=TokenResponse)
-async def login(credentials: UserLogin):
-    """Login user and return access token"""
+@router.post("/login")
+@limiter.limit("5/minute")
+async def login(request: Request, credentials: UserLogin):
+    """Login user and return OTP message or token for fast pass"""
     connection = get_db_connection()
     if not connection:
         raise HTTPException(
@@ -200,19 +232,118 @@ async def login(credentials: UserLogin):
         )
     
     try:
+        try:
+            migrate_users_otp_columns(connection)
+        except mysql.connector.Error as mig_err:
+            logger.error("OTP column migration failed: %s", mig_err)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Database schema update failed. Check server logs.",
+            ) from mig_err
+
         cursor = connection.cursor(dictionary=True)
-        cursor.execute("SELECT * FROM users WHERE username = %s", (credentials.username,))
+        cursor.execute("SELECT * FROM users WHERE email = %s", (credentials.email,))
         user = cursor.fetchone()
-        cursor.close()
-        connection.close()
         
-        if not user or not verify_password(credentials.password, user["password_hash"]):
+
+        if not user:
+            cursor.close()
+            connection.close()
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid username or password"
+                detail="User not found"
             )
+            
+        # Generate OTP for all users
+        otp_code = f"{random.randint(100000, 999999)}"
+        otp_expiry = datetime.now() + timedelta(minutes=10)
         
-        # Create access token
+        cursor.execute(
+            "UPDATE users SET verification_code = %s, verification_code_expires = %s WHERE id = %s",
+            (otp_code, otp_expiry, user["id"])
+        )
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+        try:
+            send_otp_email(credentials.email, otp_code)
+        except Exception as mail_err:
+            logger.exception("send_otp_email failed after OTP was stored: %s", mail_err)
+
+        return {
+            "message": "OTP sent to email",
+            "email": credentials.email
+        }
+
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("login failed")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Login failed: {str(e)}"
+        )
+
+
+@router.post("/verify", response_model=TokenResponse)
+async def verify_otp(verify_data: UserVerify):
+    """Verify OTP and return access token"""
+    connection = get_db_connection()
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed"
+        )
+        
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT * FROM pending_registrations WHERE email = %s AND verification_code = %s AND verification_code_expires > NOW()",
+            (verify_data.email, verify_data.otp)
+        )
+        pending_user = cursor.fetchone()
+        
+        if pending_user:
+            # Move to users table
+            dummy_hash = "otp_auth_only"
+            cursor.execute(
+                """
+                INSERT INTO users (username, email, password_hash, role)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (pending_user["username"], pending_user["email"], dummy_hash, pending_user["role"])
+            )
+            user_id = cursor.lastrowid
+            
+            cursor.execute("DELETE FROM pending_registrations WHERE id = %s", (pending_user["id"],))
+            connection.commit()
+            
+            cursor.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+            user = cursor.fetchone()
+        else:
+            cursor.execute(
+                "SELECT * FROM users WHERE email = %s AND verification_code = %s AND verification_code_expires > NOW()",
+                (verify_data.email, verify_data.otp)
+            )
+            user = cursor.fetchone()
+            
+            if not user:
+                # Check if it's because of wrong OTP or expired
+                cursor.execute("SELECT id FROM users WHERE email = %s UNION SELECT id FROM pending_registrations WHERE email = %s", (verify_data.email, verify_data.email))
+                if cursor.fetchone():
+                    raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Invalid or expired OTP")
+                else:
+                    raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+                    
+            # Clear OTP
+            cursor.execute(
+                "UPDATE users SET verification_code = NULL, verification_code_expires = NULL WHERE id = %s",
+                (user["id"],)
+            )
+            connection.commit()
+        
         access_token = create_access_token(
             data={"user_id": user["id"], "username": user["username"], "role": user["role"]}
         )
@@ -227,14 +358,63 @@ async def login(credentials: UserLogin):
                 "role": user["role"]
             }
         }
-        
     except HTTPException:
         raise
     except Exception as e:
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Login failed: {str(e)}"
+            detail=f"Verification failed: {str(e)}"
         )
+    finally:
+        cursor.close()
+        connection.close()
+
+
+@router.post("/resend-otp")
+@limiter.limit("3/minute")
+async def resend_otp(request: Request, body: EmailRequest):
+    """Resend OTP to existing user or pending registration"""
+    connection = get_db_connection()
+    if not connection:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Database connection failed")
+        
+    try:
+        cursor = connection.cursor(dictionary=True)
+        # Check users table first (for login flow)
+        cursor.execute("SELECT id FROM users WHERE email = %s", (body.email,))
+        user = cursor.fetchone()
+
+        otp_code = f"{random.randint(100000, 999999)}"
+        otp_expiry = datetime.now() + timedelta(minutes=10)
+
+        if user:
+            cursor.execute(
+                "UPDATE users SET verification_code = %s, verification_code_expires = %s WHERE id = %s",
+                (otp_code, otp_expiry, user["id"])
+            )
+        else:
+            # Check pending_registrations
+            cursor.execute("SELECT id FROM pending_registrations WHERE email = %s", (body.email,))
+            pending_user = cursor.fetchone()
+            if pending_user:
+                cursor.execute(
+                    "UPDATE pending_registrations SET verification_code = %s, verification_code_expires = %s WHERE id = %s",
+                    (otp_code, otp_expiry, pending_user["id"])
+                )
+            else:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+        connection.commit()
+        send_otp_email(body.email, otp_code)
+        
+        return {"message": "OTP resent successfully"}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=f"Failed to resend OTP: {str(e)}")
+    finally:
+        cursor.close()
+        connection.close()
 
 
 @router.get("/me", response_model=UserResponse)
@@ -249,6 +429,120 @@ async def get_me(current_user: dict = Depends(get_current_user)):
     }
 
 
+class UpdateProfileRequest(BaseModel):
+    username: str
+
+    @field_validator("username")
+    @classmethod
+    def validate_username(cls, v: str) -> str:
+        if not v:
+            raise ValueError("Username cannot be empty")
+        if not _USERNAME_RE.match(v):
+            raise ValueError(
+                "Username may only contain lowercase letters, digits, and underscores"
+            )
+        return v
+
+
+@router.put("/me")
+async def update_profile(
+    update: UpdateProfileRequest,
+    current_user: dict = Depends(get_current_user),
+):
+    """Update current user's username"""
+    if update.username == current_user["username"]:
+        return {"message": "No changes made", "username": current_user["username"]}
+
+    connection = get_db_connection()
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
+        )
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        # Uniqueness check across both tables
+        cursor.execute(
+            "SELECT id FROM users WHERE username = %s AND id != %s "
+            "UNION SELECT id FROM pending_registrations WHERE username = %s",
+            (update.username, current_user["id"], update.username),
+        )
+        if cursor.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already taken",
+            )
+
+        cursor.execute(
+            "UPDATE users SET username = %s WHERE id = %s",
+            (update.username, current_user["id"]),
+        )
+        connection.commit()
+        cursor.close()
+        connection.close()
+
+        return {"message": "Profile updated", "username": update.username}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update profile: {str(e)}",
+        )
+
+
+@router.get("/me/stats")
+async def get_my_stats(current_user: dict = Depends(get_current_user)):
+    """Get activity stats for the current user"""
+    connection = get_db_connection()
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
+        )
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+
+        cursor.execute(
+            "SELECT COUNT(*) AS cnt FROM datasets WHERE user_id = %s",
+            (current_user["id"],),
+        )
+        projects_owned = cursor.fetchone()["cnt"]
+
+        cursor.execute(
+            "SELECT COUNT(*) AS cnt FROM project_members WHERE user_id = %s",
+            (current_user["id"],),
+        )
+        projects_member = cursor.fetchone()["cnt"]
+
+        cursor.execute(
+            """
+            SELECT COUNT(*) AS cnt FROM annotations a
+            JOIN datasets d ON a.dataset_id = d.id
+            WHERE d.user_id = %s
+            """,
+            (current_user["id"],),
+        )
+        annotations_count = cursor.fetchone()["cnt"]
+
+        cursor.close()
+        connection.close()
+
+        return {
+            "projects_owned": projects_owned,
+            "projects_member": projects_member,
+            "annotations_saved": annotations_count,
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch stats: {str(e)}",
+        )
+
+
 @router.get("/permissions")
 async def get_my_permissions(current_user: dict = Depends(get_current_user)):
     """Get current user's permissions"""
@@ -256,6 +550,24 @@ async def get_my_permissions(current_user: dict = Depends(get_current_user)):
     return {
         "role": current_user["role"],
         "permissions": permissions
+    }
+
+
+@router.post("/extend-session", response_model=TokenResponse)
+async def extend_session(current_user: dict = Depends(get_current_user)):
+    access_token = create_access_token(
+        data={"user_id": current_user["id"], "username": current_user["username"], "role": current_user["role"]}
+    )
+
+    return {
+        "access_token": access_token,
+        "token_type": "bearer",
+        "user": {
+            "id": current_user["id"],
+            "username": current_user["username"],
+            "email": current_user["email"],
+            "role": current_user["role"],
+        },
     }
 
 
@@ -283,6 +595,52 @@ async def list_users(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error fetching users: {str(e)}"
+        )
+
+
+@router.get("/users/by-username/{username}")
+async def get_user_by_username(
+    username: str,
+    current_user: dict = Depends(get_current_user),
+):
+    """Find a user by their username (any authenticated user)"""
+    if not _USERNAME_RE.match(username):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid username format",
+        )
+
+    connection = get_db_connection()
+    if not connection:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Database connection failed",
+        )
+
+    try:
+        cursor = connection.cursor(dictionary=True)
+        cursor.execute(
+            "SELECT id, username, email, role, created_at FROM users WHERE username = %s",
+            (username,),
+        )
+        user = cursor.fetchone()
+        cursor.close()
+        connection.close()
+
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found",
+            )
+
+        user["created_at"] = str(user["created_at"])
+        return user
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error fetching user: {str(e)}",
         )
 
 

@@ -319,8 +319,9 @@ class AnnotationService:
             
             connection.commit()
             
-            # Mark image as annotated
-            DatasetService.mark_image_annotated(dataset_id, image_id, True)
+            # Only mark as annotated when the image actually has labels
+            is_annotated = len(boxes) > 0 and status not in ("unlabeled",)
+            DatasetService.mark_image_annotated(dataset_id, image_id, is_annotated)
             
             # Update image split if provided
             if split:
@@ -560,4 +561,190 @@ class DatasetVersionService:
         except Error as e:
             print(f"Error listing dataset versions: {e}")
             if connection: connection.close()
+            return []
+
+
+class TrainingJobService:
+    """Persist training job state to the training_jobs table so restarts don't lose history."""
+
+    @staticmethod
+    def upsert_job(job_id: str, data: dict) -> bool:
+        connection = get_db_connection()
+        if not connection:
+            return False
+        try:
+            cursor = connection.cursor()
+            config = data.get("config", {})
+            cursor.execute("""
+                INSERT INTO training_jobs
+                    (id, dataset_id, model_name, status, progress, epochs, batch_size, config, results, error_message, created_at)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    status       = VALUES(status),
+                    progress     = VALUES(progress),
+                    config       = VALUES(config),
+                    results      = VALUES(results),
+                    error_message = VALUES(error_message)
+            """, (
+                job_id,
+                data.get("dataset_id"),
+                config.get("model_name", ""),
+                data.get("status", "pending"),
+                int(data.get("progress", 0)),
+                config.get("epochs", 0),
+                config.get("batch_size", 16),
+                json.dumps(config),
+                json.dumps(data.get("results")) if data.get("results") else None,
+                data.get("error"),
+                data.get("created_at", datetime.now().isoformat()),
+            ))
+            connection.commit()
+            cursor.close()
+            connection.close()
+            return True
+        except Error as e:
+            print(f"Error upserting training job: {e}")
+            if connection:
+                connection.close()
+            return False
+
+    @staticmethod
+    def load_all_jobs() -> dict:
+        """Load all persisted jobs as the in-memory dict format used by training.py."""
+        connection = get_db_connection()
+        if not connection:
+            return {}
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute("""
+                SELECT id, dataset_id, model_name, status, progress, epochs, batch_size,
+                       config, results, error_message, created_at
+                FROM training_jobs
+                ORDER BY created_at ASC
+            """)
+            rows = cursor.fetchall()
+            cursor.close()
+            connection.close()
+            jobs = {}
+            for row in rows:
+                config_data = json.loads(row["config"]) if row["config"] else {}
+                jobs[row["id"]] = {
+                    "status": row["status"],
+                    "progress": row["progress"],
+                    "dataset_id": row["dataset_id"],
+                    "config": config_data,
+                    "metrics": json.loads(row["results"]) if row["results"] else {},
+                    "error": row["error_message"],
+                    "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                }
+            return jobs
+        except Error as e:
+            print(f"Error loading training jobs: {e}")
+            if connection:
+                connection.close()
+            return {}
+
+
+class QualitySnapshotService:
+    """Service for persisting and retrieving dataset quality analysis snapshots"""
+
+    # Fields stored in list columns that we truncate before persisting to keep row size manageable
+    _TRUNCATE_FIELDS = (
+        "blurry_images", "dark_images", "overexposed_images", "low_contrast_images",
+        "corrupt_images", "duplicate_images", "near_duplicate_images",
+        "label_mismatches", "invalid_boxes", "empty_annotations",
+        "invalid_class_ids", "boxes_out_of_bounds", "structure_issues",
+        "warnings", "recommendations",
+    )
+    _MAX_LIST_LEN = 50
+
+    @classmethod
+    def _slim_snapshot(cls, analysis_dict: Dict) -> str:
+        """Trim long list fields before JSON serialisation."""
+        slim = dict(analysis_dict)
+        for key in cls._TRUNCATE_FIELDS:
+            if isinstance(slim.get(key), list) and len(slim[key]) > cls._MAX_LIST_LEN:
+                slim[key] = slim[key][: cls._MAX_LIST_LEN]
+        return json.dumps(slim, default=str)
+
+    @staticmethod
+    def save_snapshot(dataset_id: str, analysis_dict: Dict) -> bool:
+        """Persist a quality analysis run to the database."""
+        connection = get_db_connection()
+        if not connection:
+            return False
+        try:
+            cursor = connection.cursor()
+            near_dup_count = len(analysis_dict.get("near_duplicate_images") or [])
+            blurry_count = (analysis_dict.get("image_quality_flags") or {}).get("blurry", 0)
+            slim_json = QualitySnapshotService._slim_snapshot(analysis_dict)
+            cursor.execute(
+                """
+                INSERT INTO dataset_quality_snapshots
+                    (dataset_id, overall_quality_score, class_balance_score,
+                     label_accuracy_score, iou_consistency_score,
+                     total_images, annotated_images,
+                     duplicate_count, near_duplicate_count, corrupt_count, blurry_count,
+                     full_snapshot)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                """,
+                (
+                    dataset_id,
+                    analysis_dict.get("overall_quality_score", 0),
+                    analysis_dict.get("class_balance_score", 0),
+                    analysis_dict.get("label_accuracy_score", 0),
+                    analysis_dict.get("iou_consistency_score", 0),
+                    analysis_dict.get("total_images", 0),
+                    analysis_dict.get("annotated_images", 0),
+                    len(analysis_dict.get("duplicate_images") or []),
+                    near_dup_count,
+                    len(analysis_dict.get("corrupt_images") or []),
+                    blurry_count,
+                    slim_json,
+                ),
+            )
+            connection.commit()
+            cursor.close()
+            connection.close()
+            return True
+        except Error as e:
+            print(f"Error saving quality snapshot: {e}")
+            if connection:
+                connection.close()
+            return False
+
+    @staticmethod
+    def get_history(dataset_id: str, limit: int = 30) -> List[Dict]:
+        """Return last N snapshots for a dataset ordered oldest-first (for trend charts)."""
+        connection = get_db_connection()
+        if not connection:
+            return []
+        try:
+            cursor = connection.cursor(dictionary=True)
+            cursor.execute(
+                """
+                SELECT id, overall_quality_score, class_balance_score,
+                       label_accuracy_score, iou_consistency_score,
+                       total_images, annotated_images,
+                       duplicate_count, near_duplicate_count, corrupt_count, blurry_count,
+                       created_at
+                FROM dataset_quality_snapshots
+                WHERE dataset_id = %s
+                ORDER BY created_at ASC
+                LIMIT %s
+                """,
+                (dataset_id, limit),
+            )
+            rows = cursor.fetchall()
+            cursor.close()
+            connection.close()
+            result = []
+            for row in rows:
+                row["created_at"] = row["created_at"].isoformat() if row["created_at"] else None
+                result.append(dict(row))
+            return result
+        except Error as e:
+            print(f"Error fetching quality history: {e}")
+            if connection:
+                connection.close()
             return []

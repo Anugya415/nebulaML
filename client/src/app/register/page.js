@@ -4,183 +4,282 @@ import { useState } from "react";
 import { useRouter } from "next/navigation";
 import { useAuth } from "@/context/AuthContext";
 import { Button } from "@/components/ui/button";
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
-import { Zap, AlertCircle } from "lucide-react";
+import { Zap, AlertCircle, Mail, KeyRound, User, Briefcase, ArrowRight, ArrowLeft } from "lucide-react";
+import { motion, AnimatePresence } from "framer-motion";
 
 export default function RegisterPage() {
   const router = useRouter();
-  const { register } = useAuth();
+  const { register, verifyOtp, resendOtp } = useAuth();
   const [formData, setFormData] = useState({
     username: "",
     email: "",
-    password: "",
-    confirmPassword: "",
+    otp: "",
     role: "user"
   });
+  const [step, setStep] = useState("details"); // "details" or "otp"
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [resendLoading, setResendLoading] = useState(false);
+  const [resendSuccess, setResendSuccess] = useState("");
+
+  const handleResend = async () => {
+    setResendLoading(true);
+    setError("");
+    setResendSuccess("");
+    const result = await resendOtp(formData.email);
+    if (result.success) {
+      setResendSuccess("Code resent successfully!");
+    } else {
+      setError(result.error);
+    }
+    setResendLoading(false);
+  };
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setError("");
-
-    if (formData.password !== formData.confirmPassword) {
-      setError("Passwords do not match");
-      return;
-    }
-
-    if (formData.password.length < 6) {
-      setError("Password must be at least 6 characters");
-      return;
-    }
-
     setLoading(true);
 
-    const result = await register(
-      formData.username,
-      formData.email,
-      formData.password,
-      formData.role
-    );
+    if (step === "details") {
+      const result = await register(
+        formData.username,
+        formData.email,
+        formData.role
+      );
 
-    if (result.success) {
-      router.push("/dashboard");
+      if (result.success) {
+        setStep("otp");
+      } else {
+        setError(result.error);
+      }
     } else {
-      setError(result.error);
+      const result = await verifyOtp(formData.email, formData.otp);
+      if (result.success) {
+        router.push("/dashboard");
+      } else {
+        setError(result.error);
+      }
     }
 
     setLoading(false);
   };
 
   return (
-    <div className="min-h-screen bg-background flex items-center justify-center p-4">
-      <div className="w-full max-w-md">
-        {/* Logo */}
-        <div className="text-center mb-8">
-          <Zap className="text-4xl text-primary mx-auto mb-4" />
-          <h1 className="text-2xl font-bold">Create Account</h1>
-          <p className="text-muted-foreground text-sm">Join YOLO Generator today</p>
+    <div className="min-h-screen bg-[#030303] text-gray-100 flex flex-col items-center justify-center p-4 relative overflow-hidden">
+      {/* Dynamic Background */}
+      <div className="absolute top-[20%] right-[-10%] w-[40vw] h-[40vw] rounded-full bg-emerald-600/10 blur-[120px] pointer-events-none" />
+      <div className="absolute bottom-[-10%] left-[-10%] w-[40vw] h-[40vw] rounded-full bg-indigo-600/20 blur-[120px] pointer-events-none" />
+
+      <div className="w-full max-w-md relative z-10">
+        <div className="text-center mb-10">
+          <div className="inline-flex items-center justify-center p-3 bg-white/5 rounded-2xl border border-white/10 mb-6 shadow-[0_0_30px_rgba(79,70,229,0.15)]">
+            <Zap className="text-3xl text-indigo-400" />
+          </div>
+          <h1 className="text-3xl font-bold tracking-tight bg-gradient-to-r from-white to-white/60 bg-clip-text text-transparent mb-2">
+            Create Account
+          </h1>
+          <p className="text-gray-400 text-sm">Join the platform in seconds</p>
         </div>
 
-        {/* Register Card */}
-        <Card className="border-border">
-          <CardHeader>
-            <CardTitle className="text-xl">Register</CardTitle>
-            <CardDescription>
-              Create your account to get started
-            </CardDescription>
-          </CardHeader>
-          <CardContent>
-            <form onSubmit={handleSubmit} className="space-y-4">
+        <div className="bg-white/[0.03] backdrop-blur-2xl border border-white/10 rounded-3xl p-8 shadow-2xl relative overflow-hidden">
+          <div className="absolute inset-x-0 top-0 h-px bg-gradient-to-r from-transparent via-white/20 to-transparent" />
+          
+          <form onSubmit={handleSubmit} className="space-y-6">
+            <AnimatePresence mode="wait" initial={false}>
               {error && (
-                <div className="p-3 rounded-lg bg-destructive/10 border border-destructive/30 flex items-center gap-2 text-destructive text-sm">
-                  <AlertCircle className="flex-shrink-0" />
-                  <p>{error}</p>
-                </div>
-              )}
-
-              <div className="space-y-2">
-                <Label htmlFor="username">Username</Label>
-                <Input
-                  id="username"
-                  type="text"
-                  placeholder="Username"
-                  value={formData.username}
-                  onChange={(e) => setFormData({ ...formData, username: e.target.value })}
-                  required
-                />
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="email">Email</Label>
-                <Input
-                  id="email"
-                  type="email"
-                  placeholder="Email"
-                  value={formData.email}
-                  onChange={(e) => setFormData({ ...formData, email: e.target.value })}
-                  required
-                />
-              </div>
-
-              <div className="grid grid-cols-2 gap-4">
-                <div className="space-y-2">
-                  <Label htmlFor="password">Password</Label>
-                  <Input
-                    id="password"
-                    type="password"
-                    placeholder="Password"
-                    value={formData.password}
-                    onChange={(e) => setFormData({ ...formData, password: e.target.value })}
-                    required
-                    minLength={6}
-                  />
-                </div>
-                <div className="space-y-2">
-                  <Label htmlFor="confirmPassword">Confirm</Label>
-                  <Input
-                    id="confirmPassword"
-                    type="password"
-                    placeholder="Confirm"
-                    value={formData.confirmPassword}
-                    onChange={(e) => setFormData({ ...formData, confirmPassword: e.target.value })}
-                    required
-                  />
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <Label htmlFor="role">Role</Label>
-                <Select value={formData.role} onValueChange={(value) => setFormData({ ...formData, role: value })}>
-                  <SelectTrigger>
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    <SelectItem value="user">User (Full Access)</SelectItem>
-                    <SelectItem value="viewer">Viewer (Read Only)</SelectItem>
-                  </SelectContent>
-                </Select>
-              </div>
-
-              <Button
-                type="submit"
-                className="w-full"
-                disabled={loading}
-              >
-                {loading ? "Creating account..." : "Create Account"}
-              </Button>
-            </form>
-
-            <div className="mt-6 text-center">
-              <p className="text-sm text-muted-foreground">
-                Already have an account?{" "}
-                <button
-                  onClick={() => router.push("/login")}
-                  className="text-primary hover:underline"
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="p-4 rounded-xl bg-red-500/10 border border-red-500/20 flex items-start gap-3 text-red-400 text-sm"
                 >
-                  Sign in
-                </button>
-              </p>
-            </div>
-          </CardContent>
-        </Card>
+                  <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <p className="leading-relaxed">{error}</p>
+                </motion.div>
+              )}
+              {resendSuccess && (
+                <motion.div
+                  initial={{ opacity: 0, y: -10 }}
+                  animate={{ opacity: 1, y: 0 }}
+                  exit={{ opacity: 0, y: -10 }}
+                  className="p-4 rounded-xl bg-emerald-500/10 border border-emerald-500/20 flex items-start gap-3 text-emerald-400 text-sm"
+                >
+                  <AlertCircle className="w-5 h-5 flex-shrink-0 mt-0.5" />
+                  <p className="leading-relaxed">{resendSuccess}</p>
+                </motion.div>
+              )}
+            </AnimatePresence>
 
-        {/* Back to home */}
-        <div className="text-center mt-6">
-          <Button
-            variant="ghost"
-            size="sm"
+            <AnimatePresence mode="wait" initial={false}>
+              {step === "details" ? (
+                <motion.div
+                  key="details-step"
+                  initial={{ opacity: 0, x: -20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: 20 }}
+                  transition={{ duration: 0.3 }}
+                  className="space-y-5"
+                >
+                  <div className="space-y-2">
+                    <Label htmlFor="username" className="text-gray-300 ml-1">Username</Label>
+                    <div className="relative group">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <User className="h-5 w-5 text-gray-500 group-focus-within:text-indigo-400 transition-colors" />
+                      </div>
+                      <Input
+                        id="username"
+                        type="text"
+                        placeholder="Choose a username"
+                        value={formData.username}
+                        onChange={(e) => setFormData({ ...formData, username: e.target.value })}
+                        required
+                        className="pl-11 h-12 bg-black/40 border-white/10 text-white placeholder:text-gray-600 focus-visible:ring-indigo-500/50 focus-visible:border-indigo-500/50 rounded-xl transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="email" className="text-gray-300 ml-1">Email Address</Label>
+                    <div className="relative group">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <Mail className="h-5 w-5 text-gray-500 group-focus-within:text-indigo-400 transition-colors" />
+                      </div>
+                      <Input
+                        id="email"
+                        type="email"
+                        placeholder="hello@example.com"
+                        value={formData.email}
+                        onChange={(e) => setFormData({ ...formData, email: e.target.value })}
+                        required
+                        className="pl-11 h-12 bg-black/40 border-white/10 text-white placeholder:text-gray-600 focus-visible:ring-indigo-500/50 focus-visible:border-indigo-500/50 rounded-xl transition-all"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-2">
+                    <Label htmlFor="role" className="text-gray-300 ml-1">User Role</Label>
+                    <div className="relative group">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none z-10">
+                        <Briefcase className="h-5 w-5 text-gray-500 group-focus-within:text-indigo-400 transition-colors" />
+                      </div>
+                      <Select value={formData.role} onValueChange={(value) => setFormData({ ...formData, role: value })}>
+                        <SelectTrigger className="pl-11 h-12 bg-black/40 border-white/10 text-white focus:ring-indigo-500/50 rounded-xl transition-all relative z-0">
+                          <SelectValue placeholder="Select a role" />
+                        </SelectTrigger>
+                        <SelectContent className="bg-[#111] border-white/10 text-white">
+                          <SelectItem value="user" className="focus:bg-white/10 focus:text-white">User (Full Access)</SelectItem>
+                          <SelectItem value="viewer" className="focus:bg-white/10 focus:text-white">Viewer (Read Only)</SelectItem>
+                        </SelectContent>
+                      </Select>
+                    </div>
+                  </div>
+
+                  <Button
+                    type="submit"
+                    className="w-full h-12 mt-4 rounded-xl bg-gradient-to-r from-indigo-500 to-emerald-500 hover:from-indigo-400 hover:to-emerald-400 text-white font-medium shadow-[0_0_20px_rgba(16,185,129,0.2)] transition-all hover:scale-[1.02] active:scale-[0.98]"
+                    disabled={loading}
+                  >
+                    {loading ? (
+                      <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                    ) : (
+                      <>
+                        Continue <ArrowRight className="w-4 h-4 ml-2" />
+                      </>
+                    )}
+                  </Button>
+                </motion.div>
+              ) : (
+                <motion.div
+                  key="otp-step"
+                  initial={{ opacity: 0, x: 20 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  exit={{ opacity: 0, x: -20 }}
+                  transition={{ duration: 0.3 }}
+                  className="space-y-6"
+                >
+                  <div className="space-y-3">
+                    <Label htmlFor="otp" className="text-gray-300 ml-1">Verification Code</Label>
+                    <div className="relative group">
+                      <div className="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+                        <KeyRound className="h-5 w-5 text-gray-500 group-focus-within:text-emerald-400 transition-colors" />
+                      </div>
+                      <Input
+                        id="otp"
+                        type="text"
+                        placeholder="6-digit code"
+                        value={formData.otp}
+                        onChange={(e) => setFormData({ ...formData, otp: e.target.value })}
+                        required
+                        maxLength={6}
+                        className="pl-11 h-12 bg-black/40 border-white/10 text-white placeholder:text-gray-600 focus-visible:ring-emerald-500/50 focus-visible:border-emerald-500/50 rounded-xl tracking-widest transition-all"
+                      />
+                    </div>
+                    <p className="text-xs text-gray-500 ml-1">
+                      We sent a code to <span className="text-gray-300 font-medium">{formData.email}</span>
+                      <br/>
+                      <button 
+                        type="button" 
+                        onClick={handleResend}
+                        disabled={resendLoading}
+                        className="text-indigo-400 hover:text-indigo-300 transition-colors mt-2"
+                      >
+                        {resendLoading ? "Sending..." : "Resend Code"}
+                      </button>
+                    </p>
+                  </div>
+
+                  <div className="space-y-3">
+                    <Button
+                      type="submit"
+                      className="w-full h-12 rounded-xl bg-gradient-to-r from-emerald-600 flex items-center justify-center to-teal-500 hover:from-emerald-500 hover:to-teal-400 text-white font-medium shadow-[0_0_20px_rgba(16,185,129,0.3)] transition-all hover:scale-[1.02] active:scale-[0.98]"
+                      disabled={loading || formData.otp.length < 6}
+                    >
+                      {loading ? (
+                        <div className="w-5 h-5 border-2 border-white/30 border-t-white rounded-full animate-spin" />
+                      ) : (
+                        "Verify & Create Account"
+                      )}
+                    </Button>
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      className="w-full h-12 rounded-xl text-gray-400 hover:text-white hover:bg-white/5 transition-all"
+                      onClick={() => setStep("details")}
+                    >
+                      <ArrowLeft className="w-4 h-4 mr-2" /> Back
+                    </Button>
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </form>
+
+          <div className="mt-8 text-center pt-6 border-t border-white/5">
+            <p className="text-sm text-gray-400">
+              Already have an account?{" "}
+              <button
+                onClick={() => router.push("/login")}
+                className="font-medium text-indigo-400 hover:text-indigo-300 transition-colors"
+                type="button"
+              >
+                Sign in
+              </button>
+            </p>
+          </div>
+        </div>
+
+        <div className="text-center mt-8">
+          <button
             onClick={() => router.push("/home")}
-            className="text-muted-foreground"
+            className="text-sm text-gray-500 hover:text-gray-300 transition-colors inline-flex items-center"
           >
-            ← Back to home
-          </Button>
+            <ArrowLeft className="w-4 h-4 mr-2" /> Return to Home
+          </button>
         </div>
       </div>
     </div>
   );
 }
-

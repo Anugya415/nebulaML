@@ -24,6 +24,8 @@ import copy
 # sys.path.append(str(Path(__file__).parent.parent.parent))
 from app.services.database import DatasetService, AnnotationService
 from app.api.v1.endpoints.auth import get_current_user
+from app.db.session import get_db_connection
+from app.core.access import require_role, effective_role
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -114,18 +116,42 @@ async def create_dataset(
 @router.get("/datasets/list")
 async def list_datasets(current_user: dict = Depends(get_current_user)):
     """
-    List all datasets
+    List all datasets owned by or shared with the current user.
     """
-    # Get from database
-    db_datasets = DatasetService.list_datasets(user_id=current_user["id"])
-    
-    # Also sync with memory for compatibility
-    for db_dataset in db_datasets:
-        datasets_db[db_dataset['id']] = db_dataset
-    
-    return {
-        "datasets": db_datasets
-    }
+    owned = DatasetService.list_datasets(user_id=current_user["id"])
+
+    # Fetch datasets where the user is a project member but not the owner
+    member_datasets = []
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor(dictionary=True)
+            cursor.execute(
+                "SELECT dataset_id FROM project_members WHERE user_id = %s",
+                (current_user["id"],),
+            )
+            member_ids = [r["dataset_id"] for r in cursor.fetchall()]
+            owned_ids = {d["id"] for d in owned}
+            for did in member_ids:
+                if did not in owned_ids:
+                    ds = DatasetService.get_dataset(did)
+                    if ds:
+                        member_datasets.append(ds)
+        finally:
+            conn.close()
+
+    # Deduplicate by id (guard against any edge-case double-listing)
+    seen_ids: set = set()
+    all_datasets = []
+    for ds in owned + member_datasets:
+        if ds["id"] not in seen_ids:
+            seen_ids.add(ds["id"])
+            all_datasets.append(ds)
+
+    for ds in all_datasets:
+        datasets_db[ds["id"]] = ds
+
+    return {"datasets": all_datasets}
 
 @router.get("/datasets/{dataset_id}")
 async def get_dataset(
@@ -140,13 +166,12 @@ async def get_dataset(
     
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-    
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "viewer")
+
     # Sync with memory
     datasets_db[dataset_id] = db_dataset
-    
+
     return db_dataset
 
 @router.post("/datasets/{dataset_id}/upload")
@@ -161,10 +186,9 @@ async def upload_images_to_dataset(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-    
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "annotator")
+
     # Validate files list
     if not files or len(files) == 0:
         raise HTTPException(status_code=400, detail="No files provided")
@@ -234,6 +258,19 @@ async def upload_images_to_dataset(
                 errors.append(f"{file.filename}: Failed to write file")
                 continue
             
+            # Pixel-level image validation — confirm the file is actually decodeable
+            try:
+                from PIL import Image as PILImage
+                with PILImage.open(file_path) as pil_img:
+                    pil_img.verify()  # raises if corrupt
+            except Exception:
+                try:
+                    file_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+                errors.append(f"{file.filename}: Image is corrupt or unreadable (failed pixel validation)")
+                continue
+            
             # Add to database
             DatasetService.add_image(
                 dataset_id=dataset_id,
@@ -290,23 +327,12 @@ async def upload_images_to_dataset(
     return JSONResponse(content=response_data)
 
 @router.post("/save")
-@router.post("/annotations/save")  # Legacy alias to handle potential caching/old frontend
-async def save_annotation(request: dict = Body(...)):
+@router.post("/annotations/save")
+async def save_annotation(request: dict = Body(...), current_user: dict = Depends(get_current_user)):
     """
     Save image annotations
     """
     dataset_id = request.get("dataset_id")
-    
-    # Check authorization first
-    try:
-        from app.api.v1.endpoints.auth import get_current_user, security
-        # We need to manually extract the user here or change this to depend on current user
-        # Note: Depending on current_user via dependency injection is better, but since
-        # this endpoint was written flexibly, let's keep it functionally sound.
-        # As it has @router.post, let's just make the changes to the def directly.
-    except Exception as e:
-        pass
-    
     image_id = request.get("image_id")
     image_name = request.get("image_name")
     width = request.get("width")
@@ -315,6 +341,30 @@ async def save_annotation(request: dict = Body(...)):
     status = request.get("status", "annotated") # Default to annotated if manually saved
     split = request.get("split")
     annotation_type = request.get("annotation_type", "detection")  # 'detection' or 'classification'
+
+    if not dataset_id or not image_id:
+        raise HTTPException(status_code=400, detail="dataset_id and image_id are required")
+
+    # Verify dataset exists and caller has annotator or higher role
+    db_dataset = DatasetService.get_dataset(dataset_id)
+    if not db_dataset:
+        raise HTTPException(status_code=404, detail="Dataset not found")
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "annotator")
+
+    # Verify image belongs to this dataset
+    image_belongs = any(img["id"] == image_id for img in db_dataset.get("images", []))
+    if not image_belongs:
+        raise HTTPException(status_code=404, detail="Image not found in this dataset")
+
+    # Validate class_ids are within dataset class range
+    num_classes = len(db_dataset.get("classes", []))
+    for box in boxes:
+        cid = box.get("class_id", 0)
+        if num_classes > 0 and (cid < 0 or cid >= num_classes):
+            raise HTTPException(
+                status_code=400,
+                detail=f"class_id {cid} is out of range for this dataset ({num_classes} classes)"
+            )
 
     # Validate split if provided
     if split and split not in ["train", "val", "test"]:
@@ -362,25 +412,51 @@ async def save_annotation(request: dict = Body(...)):
             for box in boxes:
                 f.write(f"{box['class_id']}\n")
         else:
-            # Detection: store class_id + normalized bbox
+            # Detection/Segmentation
             for box in boxes:
-                # Convert to YOLO format (class_id center_x center_y width height)
                 if width <= 0 or height <= 0:
                     continue
+                
+                box_type = box.get("type", "box")
+                
+                if box_type == "polygon" or box_type == "line":
+                    points = box.get("points", [])
+                    if len(points) < 2:
+                        continue
                     
-                # Normalize coordinates to 0-1
-                center_x = (box["x"] + box["width"] / 2) / width
-                center_y = (box["y"] + box["height"] / 2) / height
-                norm_width = box["width"] / width
-                norm_height = box["height"] / height
-                
-                # Clamp values to 0-1 range to be safe
-                center_x = max(0.0, min(1.0, center_x))
-                center_y = max(0.0, min(1.0, center_y))
-                norm_width = max(0.0, min(1.0, norm_width))
-                norm_height = max(0.0, min(1.0, norm_height))
-                
-                f.write(f"{box['class_id']} {center_x} {center_y} {norm_width} {norm_height}\n")
+                    # YOLO Segmentation format: class_id x1 y1 x2 y2 ... (normalized)
+                    coords = []
+                    for p in points:
+                        norm_x = max(0.0, min(1.0, p["x"] / width))
+                        norm_y = max(0.0, min(1.0, p["y"] / height))
+                        coords.extend([f"{norm_x:.6f}", f"{norm_y:.6f}"])
+                    
+                    f.write(f"{box['class_id']} {' '.join(coords)}\n")
+                    
+                elif box_type == "joint":
+                    # For joints/keypoints without bbox, a proxy bbox could be used or just a point format depending on YOLO configuration
+                    # Standard YOLO pose format requires a bbox. We'll make a tiny bounding box around the point.
+                    # format: class_id center_x center_y width height px py visibility ...
+                    center_x = max(0.0, min(1.0, box["x"] / width))
+                    center_y = max(0.0, min(1.0, box["y"] / height))
+                    pw = 0.02
+                    ph = 0.02
+                    # simple bounding box fallback
+                    f.write(f"{box['class_id']} {center_x:.6f} {center_y:.6f} {pw:.6f} {ph:.6f}\n")
+                    
+                else:
+                    # Standard Bounding Box
+                    center_x = (box["x"] + box["width"] / 2) / width
+                    center_y = (box["y"] + box["height"] / 2) / height
+                    norm_width = box["width"] / width
+                    norm_height = box["height"] / height
+                    
+                    center_x = max(0.0, min(1.0, center_x))
+                    center_y = max(0.0, min(1.0, center_y))
+                    norm_width = max(0.0, min(1.0, norm_width))
+                    norm_height = max(0.0, min(1.0, norm_height))
+                    
+                    f.write(f"{box['class_id']} {center_x:.6f} {center_y:.6f} {norm_width:.6f} {norm_height:.6f}\n")
     
     # Update memory cache
     if dataset_id in datasets_db:
@@ -461,6 +537,28 @@ async def _export_task(job_id: str, dataset_id: str, split_ratio: float, augment
         
         total_steps = len(annotated_images)
         current_step = 0
+
+        def _transform_label_line(line: str, flip_horizontal: bool, flip_vertical: bool) -> str:
+            parts = line.strip().split()
+            if not parts:
+                return ""
+            if len(parts) == 5:
+                cls, x, y, w, h = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+                if flip_horizontal:
+                    x = 1.0 - x
+                if flip_vertical:
+                    y = 1.0 - y
+                return f"{cls} {x:.6f} {y:.6f} {w:.6f} {h:.6f}\n"
+            if len(parts) >= 7 and (len(parts) % 2 == 1):
+                cls = parts[0]
+                coords = [float(p) for p in parts[1:]]
+                for i in range(0, len(coords), 2):
+                    if flip_horizontal:
+                        coords[i] = 1.0 - coords[i]
+                    if flip_vertical:
+                        coords[i + 1] = 1.0 - coords[i + 1]
+                return f"{cls} " + " ".join(f"{c:.6f}" for c in coords) + "\n"
+            return line
         
         for split_dir, images, split_name in splits:
             if images:
@@ -478,6 +576,8 @@ async def _export_task(job_id: str, dataset_id: str, split_ratio: float, augment
                     dst_label = split_dir / "labels" / label_name
                     if src_label.exists():
                         shutil.copy2(src_label, dst_label)
+                    else:
+                        (dst_label).write_text("")
 
                     if split_name == "train" and augmentations and any(augmentations.values()):
                         try:
@@ -492,10 +592,9 @@ async def _export_task(job_id: str, dataset_id: str, split_ratio: float, augment
                                     if src_label.exists():
                                         with open(src_label, 'r') as f_src, open(aug_label_path, 'w') as f_dst:
                                             for line in f_src:
-                                                parts = line.strip().split()
-                                                if len(parts) >= 5:
-                                                    cls, x, y, w, h = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                                                    f_dst.write(f"{cls} {1.0 - x} {y} {w} {h}\n")
+                                                f_dst.write(_transform_label_line(line, True, False))
+                                    else:
+                                        aug_label_path.write_text("")
                                                     
                                 if augmentations.get("flipVertical"):
                                     aug_filename = f"aug_vflip_{img['filename']}"
@@ -507,10 +606,9 @@ async def _export_task(job_id: str, dataset_id: str, split_ratio: float, augment
                                     if src_label.exists():
                                         with open(src_label, 'r') as f_src, open(aug_label_path, 'w') as f_dst:
                                             for line in f_src:
-                                                parts = line.strip().split()
-                                                if len(parts) >= 5:
-                                                    cls, x, y, w, h = parts[0], float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
-                                                    f_dst.write(f"{cls} {x} {1.0 - y} {w} {h}\n")
+                                                f_dst.write(_transform_label_line(line, False, True))
+                                    else:
+                                        aug_label_path.write_text("")
                                                     
                                 if augmentations.get("noise"):
                                     aug_filename = f"aug_noise_{img['filename']}"
@@ -520,6 +618,8 @@ async def _export_task(job_id: str, dataset_id: str, split_ratio: float, augment
                                     im_noise.save(aug_img_path)
                                     if src_label.exists():
                                         shutil.copy2(src_label, aug_label_path)
+                                    else:
+                                        aug_label_path.write_text("")
                         except Exception as e:
                             print(f"Augmentation failed for {img['filename']}: {e}")
                     
@@ -572,10 +672,13 @@ val: val/images
 
 
 @router.get("/datasets/{dataset_id}/export-status/{job_id}")
-async def get_export_status(dataset_id: str, job_id: str):
+async def get_export_status(dataset_id: str, job_id: str, current_user: dict = Depends(get_current_user)):
     if job_id not in export_jobs:
         raise HTTPException(status_code=404, detail="Job not found")
-    return export_jobs[job_id]
+    job = export_jobs[job_id]
+    if job.get("dataset_id") and job["dataset_id"] != dataset_id:
+        raise HTTPException(status_code=403, detail="Job does not belong to this dataset")
+    return job
 
 
 @router.post("/datasets/{dataset_id}/export")
@@ -591,25 +694,25 @@ async def export_dataset(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-         
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "admin")
+
     dataset = db_dataset
     dataset_dir = Path(f"datasets/{dataset_id}")
     
     all_images = DatasetService.get_dataset_images(dataset_id)
-    annotated_images = [img for img in all_images if img.get("annotated", False)]
+    annotated_images = list(all_images or [])
     
     if not annotated_images:
-        raise HTTPException(status_code=400, detail="No annotated images in dataset")
+        raise HTTPException(status_code=400, detail="No images in dataset")
     
     images_with_split = [img for img in annotated_images if img.get("split")]
     
     job_id = str(uuid.uuid4())
     export_jobs[job_id] = {
         "status": "pending",
-        "progress": 0
+        "progress": 0,
+        "dataset_id": dataset_id
     }
     
     background_tasks.add_task(
@@ -635,10 +738,9 @@ async def download_dataset(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-    
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "admin")
+
     dataset = db_dataset
     zip_path = Path(f"datasets/{dataset_id}/{dataset['name']}_export.zip")
     
@@ -662,10 +764,9 @@ async def delete_dataset(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-    
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "owner")
+
     # Delete directory
     dataset_dir = Path(f"datasets/{dataset_id}")
     if dataset_dir.exists():
@@ -693,10 +794,9 @@ async def get_dataset_stats(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-         
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "viewer")
+
     stats = AnnotationService.get_dataset_stats(dataset_id)
     return stats
 
@@ -714,10 +814,9 @@ async def update_image_split(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-    
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "annotator")
+
     split = request.get("split")
     if split and split not in ["train", "val", "test"]:
         raise HTTPException(status_code=400, detail="Split must be 'train', 'val', or 'test'")
@@ -859,7 +958,7 @@ async def get_auto_label_status(dataset_id: str, job_id: str):
     return auto_label_jobs[job_id]
 
 
-@router.post("/annotations/auto-label")
+@router.post("/auto-label")
 async def auto_label_images(
     background_tasks: BackgroundTasks,
     dataset_id: str = Form(...),
@@ -872,10 +971,9 @@ async def auto_label_images(
     db_dataset = DatasetService.get_dataset(dataset_id)
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
-        
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-         raise HTTPException(status_code=403, detail="Not authorized to access this dataset")
-         
+
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "annotator")
+
     dataset = db_dataset
 
     model_path = model_name
@@ -915,11 +1013,15 @@ async def auto_label_images(
 
 
 @router.get("/image/{dataset_id}/{image_filename}")
-async def serve_image(dataset_id: str, image_filename: str):
+async def serve_image(dataset_id: str, image_filename: str, token: Optional[str] = None):
     """
-    Serve an image file directly
+    Serve an image file.
+    Accepts auth via Bearer header OR ?token= query param so <img src> tags work.
     """
-    # Construct the file path
+    from app.core.rbac import decode_access_token
+    if not token or not decode_access_token(token):
+        raise HTTPException(status_code=401, detail="Authentication required to view images")
+
     image_path = Path(f"datasets/{dataset_id}/images/{image_filename}")
     
     if not image_path.exists():
@@ -962,8 +1064,7 @@ async def download_format(
     if not db_dataset:
         raise HTTPException(status_code=404, detail="Dataset not found")
 
-    if db_dataset.get("user_id") and db_dataset["user_id"] != current_user["id"]:
-        raise HTTPException(status_code=403, detail="Not authorized")
+    require_role(dataset_id, current_user["id"], db_dataset["user_id"], "admin")
 
     images = DatasetService.get_dataset_images(dataset_id)
     classes = db_dataset.get("classes", [])

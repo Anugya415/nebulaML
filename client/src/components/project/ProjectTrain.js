@@ -7,31 +7,143 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select";
 import { Badge } from "@/components/ui/badge";
-import { Play, Cpu, Clock } from "lucide-react";
+import { Play, Cpu, Clock, AlertCircle, Zap, Scale, Target, ShieldCheck, AlertTriangle, XCircle, CheckCircle2, Loader2, ListOrdered, Activity, StopCircle, ChevronRight } from "lucide-react";
 import { API_ENDPOINTS } from "@/lib/config";
 import { toast } from 'sonner';
+import { useAuth } from "@/context/AuthContext";
+import ProjectVersions from "@/components/project/ProjectVersions";
+import TrainingLive from "@/components/project/TrainingLive";
 
-export default function ProjectTrain({ dataset, onTrainingStarted }) {
+const PRESET_META = {
+    fast: { icon: Zap, color: "text-amber-500", label: "Fast", desc: "~5 min • Quick iteration, lower accuracy", epochs: 25, batch_size: 32, img_size: 416, model_name: "yolov8n.pt", learning_rate: 0.01, patience: 10 },
+    balanced: { icon: Scale, color: "text-blue-500", label: "Balanced", desc: "~30 min • Good speed/accuracy tradeoff", epochs: 100, batch_size: 16, img_size: 640, model_name: "yolov8s.pt", learning_rate: 0.01, patience: 50 },
+    accurate: { icon: Target, color: "text-emerald-500", label: "Accurate", desc: "~2 hrs • Maximum accuracy for production", epochs: 300, batch_size: 8, img_size: 1024, model_name: "yolov8m.pt", learning_rate: 0.001, patience: 80 },
+};
+
+export default function ProjectTrain({ dataset, onTrainingStarted, onDeploy, versionRefreshKey = 0 }) {
+    const { token } = useAuth();
+    const [versions, setVersions] = useState([]);
+    const [selectedVersionIds, setSelectedVersionIds] = useState([]);
+    const [activePreset, setActivePreset] = useState("balanced");
     const [config, setConfig] = useState({
-        epochs: 50,
+        epochs: 100,
         batch_size: 16,
         img_size: 640,
-        model_name: "yolov8n.pt",
+        model_name: "yolov8s.pt",
         learning_rate: 0.01
     });
     const [training, setTraining] = useState(false);
     const [selectedClasses, setSelectedClasses] = useState([]);
+    const [preflight, setPreflight] = useState(null);
+    const [preflightLoading, setPreflightLoading] = useState(false);
+    const [queueStatus, setQueueStatus] = useState(null);
+    const [activeJobs, setActiveJobs] = useState([]);
 
     // Initialize with all classes selected
-    useState(() => {
+    useEffect(() => {
         if (dataset?.classes) {
             setSelectedClasses([...dataset.classes]);
         }
     }, [dataset]);
 
+    // Apply preset on change
+    useEffect(() => {
+        if (activePreset && PRESET_META[activePreset]) {
+            const p = PRESET_META[activePreset];
+            setConfig({
+                epochs: p.epochs,
+                batch_size: p.batch_size,
+                img_size: p.img_size,
+                model_name: p.model_name,
+                learning_rate: p.learning_rate
+            });
+        }
+    }, [activePreset]);
+
+    // Fetch dataset versions
+    useEffect(() => {
+        const fetchVersions = async () => {
+            try {
+                const res = await fetch(API_ENDPOINTS.TRAINING.VERSIONS_LIST(dataset.id), {
+                    headers: { "Authorization": `Bearer ${token}` }
+                });
+                if (res.ok) {
+                    const data = await res.json();
+                    setVersions(data.versions || []);
+                    if (data.versions?.length > 0) setSelectedVersionIds([data.versions[0].id.toString()]);
+                }
+            } catch(e) { console.error("Failed to fetch versions:", e); }
+        };
+        fetchVersions();
+    }, [dataset.id, token, versionRefreshKey]);
+
+    useEffect(() => {
+        if (!dataset?.id) return;
+        runPreflight();
+        fetchQueueStatus();
+        fetchActiveJobs();
+        const interval = setInterval(fetchActiveJobs, 5000);
+        return () => clearInterval(interval);
+    }, [dataset?.id]);
+
+    const fetchActiveJobs = async () => {
+        try {
+            const res = await fetch(API_ENDPOINTS.TRAINING.JOBS, {
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (res.ok) {
+                const data = await res.json();
+                const running = (data.jobs || []).filter(
+                    j => j.dataset_id === dataset.id && (j.status === "running" || j.status === "pending")
+                );
+                setActiveJobs(running);
+            }
+        } catch(e) { /* non-critical */ }
+    };
+
+    const cancelJob = async (jobId) => {
+        if (!window.confirm("Stop training? The run ends after the current epoch.")) return;
+        try {
+            const res = await fetch(API_ENDPOINTS.TRAINING.CANCEL(jobId), {
+                method: "POST",
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (res.ok) {
+                toast.success("Cancellation requested");
+                fetchActiveJobs();
+                fetchQueueStatus();
+            } else {
+                const err = await res.json().catch(() => ({}));
+                toast.error(err.detail || "Failed to cancel");
+            }
+        } catch(e) { toast.error(e.message); }
+    };
+
+    const fetchQueueStatus = async () => {
+        try {
+            const res = await fetch(API_ENDPOINTS.TRAINING.QUEUE_STATUS, {
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (res.ok) setQueueStatus(await res.json());
+        } catch(e) { /* non-critical */ }
+    };
+
+    const runPreflight = async () => {
+        setPreflightLoading(true);
+        try {
+            const res = await fetch(API_ENDPOINTS.TRAINING.PREFLIGHT(dataset.id), {
+                headers: { "Authorization": `Bearer ${token}` }
+            });
+            if (res.ok) {
+                const data = await res.json();
+                setPreflight(data);
+            }
+        } catch(e) { console.error("Preflight failed:", e); }
+        finally { setPreflightLoading(false); }
+    };
+
     const toggleClass = (cls) => {
         if (selectedClasses.includes(cls)) {
-            // Don't allow deselecting the last class
             if (selectedClasses.length <= 1) {
                 toast.error("At least one class must be selected");
                 return;
@@ -44,32 +156,51 @@ export default function ProjectTrain({ dataset, onTrainingStarted }) {
 
     const toggleAll = () => {
         if (selectedClasses.length === dataset.classes.length) {
-            setSelectedClasses([...dataset.classes]);
+            setSelectedClasses([]);
         } else {
             setSelectedClasses([...dataset.classes]);
         }
     };
 
     const startTraining = async () => {
+        if (!selectedVersionIds || selectedVersionIds.length === 0) {
+            toast.error("Please select at least one dataset version.");
+            return;
+        }
+        if (preflight && !preflight.can_train) {
+            toast.error("Fix blocking issues before training.");
+            return;
+        }
         setTraining(true);
         try {
-            const response = await fetch(API_ENDPOINTS.TRAINING.START_FROM_DATASET, {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({
-                    dataset_id: dataset.id,
-                    config: config,
-                    classes: selectedClasses // Send selected classes
-                })
-            });
+            const startedJobIds = [];
+            for (const verId of selectedVersionIds) {
+                const response = await fetch(API_ENDPOINTS.TRAINING.START_FROM_DATASET, {
+                    method: "POST",
+                    headers: { 
+                        "Content-Type": "application/json",
+                        "Authorization": `Bearer ${token}` 
+                    },
+                    body: JSON.stringify({
+                        dataset_id: dataset.id,
+                        version_id: verId,
+                        config: { ...config, preset: activePreset },
+                        classes: selectedClasses
+                    })
+                });
 
-            const data = await response.json();
-            if (data.success) {
-                toast.success("Training started! Job ID: " + data.job_id);
-                if (onTrainingStarted) onTrainingStarted();
-            } else {
-                toast.error("Failed to start training: " + data.detail);
+                if (!response.ok) {
+                    const errText = await response.text();
+                    throw new Error(errText || `Server error ${response.status}`);
+                }
+                const data = await response.json();
+                if (data.success && data.job_id) startedJobIds.push(data.job_id);
             }
+
+            toast.success(`Training started for ${startedJobIds.length} version${startedJobIds.length === 1 ? "" : "s"}! You can navigate away - training will continue in the background.`);
+            fetchQueueStatus();
+            fetchActiveJobs();
+            if (onTrainingStarted) onTrainingStarted();
         } catch (e) {
             toast.error("Error: " + e.message);
         } finally {
@@ -82,32 +213,245 @@ export default function ProjectTrain({ dataset, onTrainingStarted }) {
             <div className="flex justify-between items-center">
                 <div>
                     <h2 className="text-xl font-semibold">Train Model</h2>
-                    <p className="text-muted-foreground text-sm">Train a YOLOv8 model on your dataset version.</p>
+                    <p className="text-muted-foreground text-sm">Train a YOLO model on your dataset version.</p>
                 </div>
             </div>
 
+            {/* Pre-flight Check Banner */}
+            {preflightLoading && (
+                <div className="p-3 rounded-lg border border-border bg-muted/30 flex items-center gap-2 text-sm text-muted-foreground">
+                    <Loader2 className="w-4 h-4 animate-spin" /> Running pre-flight checks...
+                </div>
+            )}
+            {/* ── Active Runs ── */}
+            {activeJobs.length > 0 && (
+                <div className="space-y-2">
+                    <div className="flex items-center gap-2 text-sm font-semibold">
+                        <Activity className="w-4 h-4 text-blue-500 animate-pulse" />
+                        <span>Active Runs ({activeJobs.length})</span>
+                    </div>
+                    {activeJobs.map(job => (
+                        <div key={job.job_id} className="rounded-lg border border-blue-500/30 bg-blue-500/5 p-4 space-y-2">
+                            <div className="flex items-center justify-between gap-3">
+                                <div className="min-w-0 flex-1">
+                                    <div className="flex items-center gap-2">
+                                        <span className="font-medium text-sm">{job.config?.model_name || "Model"}</span>
+                                        <Badge className="bg-blue-500/10 text-blue-400 border-blue-500/20 text-xs flex items-center gap-1">
+                                            {job.status === "running"
+                                                ? <><Loader2 className="w-3 h-3 animate-spin" /> Running</>
+                                                : <><Clock className="w-3 h-3" /> Pending</>}
+                                        </Badge>
+                                    </div>
+                                    <p className="text-xs text-muted-foreground font-mono mt-0.5">
+                                        Job {job.job_id.substring(0, 8)}
+                                        {job.status === "running" && ` · Epoch ${job.current_epoch || 0}/${job.config?.epochs || "?"}`}
+                                    </p>
+                                </div>
+                                <div className="flex items-center gap-2 shrink-0">
+                                    <span className="text-sm font-bold text-blue-400 tabular-nums">
+                                        {Math.round(job.progress || 0)}%
+                                    </span>
+                                    <Button
+                                        size="sm"
+                                        variant="ghost"
+                                        className="h-7 px-2 text-amber-500 hover:text-amber-400 hover:bg-amber-500/10"
+                                        onClick={() => cancelJob(job.job_id)}
+                                    >
+                                        <StopCircle className="w-3.5 h-3.5" />
+                                    </Button>
+                                </div>
+                            </div>
+                            <div className="w-full bg-muted-foreground/20 rounded-full h-1.5 overflow-hidden">
+                                <div
+                                    className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
+                                    style={{ width: `${Math.max(2, job.progress || 0)}%` }}
+                                />
+                            </div>
+                            {job.metrics && Object.keys(job.metrics).length > 0 && (
+                                <div className="flex flex-wrap gap-3 pt-1">
+                                    {[["mAP50", job.metrics?.map50 ?? job.metrics?.["map50"]], ["Precision", job.metrics?.precision], ["Recall", job.metrics?.recall]]
+                                        .filter(([, v]) => v != null)
+                                        .map(([label, val]) => (
+                                            <span key={label} className="text-xs text-muted-foreground">
+                                                {label}: <span className="font-semibold text-foreground">{(Number(val) * 100).toFixed(1)}%</span>
+                                            </span>
+                                        ))}
+                                </div>
+                            )}
+                        </div>
+                    ))}
+                </div>
+            )}
+
+            {preflight && !preflightLoading && (
+                <div className="space-y-2">
+                    {/* Quality Score */}
+                    <div className={`p-3 rounded-lg border flex items-center justify-between ${
+                        preflight.quality_score >= 70 ? 'border-emerald-500/30 bg-emerald-500/5' :
+                        preflight.quality_score >= 40 ? 'border-amber-500/30 bg-amber-500/5' : 
+                        'border-red-500/30 bg-red-500/5'
+                    }`}>
+                        <div className="flex items-center gap-2">
+                            <ShieldCheck className={`w-4 h-4 ${
+                                preflight.quality_score >= 70 ? 'text-emerald-500' :
+                                preflight.quality_score >= 40 ? 'text-amber-500' : 'text-red-500'
+                            }`} />
+                            <span className="text-sm font-medium">Dataset Quality Score</span>
+                        </div>
+                        <Badge variant={preflight.quality_score >= 70 ? "default" : "destructive"}>
+                            {preflight.quality_score}/100
+                        </Badge>
+                    </div>
+
+                    {/* Blockers */}
+                    {preflight.blockers?.map((b, i) => (
+                        <div key={`b-${i}`} className="p-3 rounded-lg border border-red-500/40 bg-red-500/10 flex items-start gap-2">
+                            <XCircle className="w-4 h-4 text-red-500 shrink-0 mt-0.5" />
+                            <div className="text-sm">
+                                <span className="font-medium text-red-500">Blocker: </span>
+                                {b.message}
+                                <p className="text-muted-foreground text-xs mt-1">{b.suggestion}</p>
+                            </div>
+                        </div>
+                    ))}
+
+                    {/* Warnings */}
+                    {preflight.warnings?.map((w, i) => (
+                        <div key={`w-${i}`} className="p-3 rounded-lg border border-amber-500/30 bg-amber-500/5 flex items-start gap-2">
+                            <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0 mt-0.5" />
+                            <div className="text-sm">
+                                <span className="font-medium text-amber-500">Warning: </span>
+                                {w.message}
+                                <p className="text-muted-foreground text-xs mt-1">{w.suggestion}</p>
+                            </div>
+                        </div>
+                    ))}
+
+                    {preflight.can_train && preflight.warnings?.length === 0 && preflight.blockers?.length === 0 && (
+                        <div className="p-3 rounded-lg border border-emerald-500/30 bg-emerald-500/5 flex items-center gap-2 text-sm">
+                            <CheckCircle2 className="w-4 h-4 text-emerald-500" />
+                            <span className="text-emerald-600 font-medium">All pre-flight checks passed!</span>
+                        </div>
+                    )}
+                </div>
+            )}
+
             <div className="grid md:grid-cols-3 gap-6">
                 <div className="md:col-span-2 space-y-6">
+                    {/* Presets */}
+                    <Card>
+                        <CardHeader>
+                            <CardTitle>Training Preset</CardTitle>
+                            <CardDescription>Choose a preset or customize settings below</CardDescription>
+                        </CardHeader>
+                        <CardContent>
+                            <div className="grid grid-cols-3 gap-3">
+                                {Object.entries(PRESET_META).map(([key, p]) => {
+                                    const Icon = p.icon;
+                                    const isActive = activePreset === key;
+                                    return (
+                                        <button
+                                            key={key}
+                                            onClick={() => setActivePreset(key)}
+                                            className={`p-4 rounded-lg border-2 transition-all text-left ${
+                                                isActive 
+                                                    ? 'border-primary bg-primary/5 shadow-sm' 
+                                                    : 'border-border hover:border-muted-foreground/30'
+                                            }`}
+                                        >
+                                            <Icon className={`w-5 h-5 mb-2 ${p.color}`} />
+                                            <p className="font-semibold text-sm">{p.label}</p>
+                                            <p className="text-xs text-muted-foreground mt-1">{p.desc}</p>
+                                        </button>
+                                    );
+                                })}
+                            </div>
+                        </CardContent>
+                    </Card>
+
+                    {/* Configuration */}
                     <Card>
                         <CardHeader>
                             <CardTitle>Configuration</CardTitle>
                         </CardHeader>
                         <CardContent className="space-y-4">
+                            <div className="space-y-2 mb-6 p-4 bg-muted/30 rounded-lg border border-border">
+                                <div className="flex items-start justify-between gap-3">
+                                    <div className="space-y-1">
+                                        <Label className="text-base font-semibold">Dataset Versions</Label>
+                                        <p className="text-xs text-muted-foreground">Select one or more versions to train in parallel.</p>
+                                    </div>
+                                    {versions.length > 0 && (
+                                        <Button
+                                            variant="ghost"
+                                            size="sm"
+                                            onClick={() => {
+                                                if (selectedVersionIds.length === versions.length) setSelectedVersionIds([]);
+                                                else setSelectedVersionIds(versions.map(v => v.id.toString()));
+                                            }}
+                                        >
+                                            {selectedVersionIds.length === versions.length ? "Clear" : "Select all"}
+                                        </Button>
+                                    )}
+                                </div>
+                                {versions.length === 0 ? (
+                                    <div className="flex items-center text-amber-500 text-sm mt-2">
+                                        <AlertCircle className="w-4 h-4 mr-2" />
+                                        No dataset versions created yet. Please go to the Generate tab to create one before training.
+                                    </div>
+                                ) : (
+                                    <div className="mt-3 max-h-56 overflow-y-auto pr-1">
+                                        <div className="space-y-2">
+                                            {versions
+                                                .slice()
+                                                .sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime())
+                                                .map((ver) => {
+                                                    const verId = ver.id.toString();
+                                                    const checked = selectedVersionIds.includes(verId);
+                                                    return (
+                                                        <div
+                                                            key={verId}
+                                                            className={`flex items-center justify-between gap-3 p-3 rounded-lg border transition-all ${
+                                                                checked ? "border-primary/40 bg-primary/5" : "border-border hover:border-muted-foreground/30 bg-background/10"
+                                                            }`}
+                                                        >
+                                                            <div className="min-w-0">
+                                                                <div className="font-semibold text-sm truncate">{ver.name}</div>
+                                                                <div className="text-xs text-muted-foreground font-mono">
+                                                                    {new Date(ver.created_at).toLocaleDateString()} • {ver.images_count} imgs
+                                                                </div>
+                                                            </div>
+                                                            <input
+                                                                type="checkbox"
+                                                                checked={checked}
+                                                                onChange={() => {
+                                                                    if (checked) setSelectedVersionIds(selectedVersionIds.filter(id => id !== verId));
+                                                                    else setSelectedVersionIds([...selectedVersionIds, verId]);
+                                                                }}
+                                                                className="h-4 w-4 accent-indigo-500"
+                                                            />
+                                                        </div>
+                                                    );
+                                                })}
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
                             <div className="grid md:grid-cols-2 gap-4">
                                 <div className="space-y-2">
                                     <Label>Model Architecture</Label>
                                     <Select
                                         value={config.model_name}
-                                        onValueChange={v => setConfig({ ...config, model_name: v })}
+                                        onValueChange={v => { setConfig({ ...config, model_name: v }); setActivePreset(null); }}
                                     >
                                         <SelectTrigger>
                                             <SelectValue />
                                         </SelectTrigger>
                                         <SelectContent>
-                                            <SelectItem value="yolov8n.pt">YOLOv8 Nano (Fastest)</SelectItem>
-                                            <SelectItem value="yolov8s.pt">YOLOv8 Small</SelectItem>
-                                            <SelectItem value="yolov8m.pt">YOLOv8 Medium</SelectItem>
-                                            <SelectItem value="yolov8l.pt">YOLOv8 Large (Most Accurate)</SelectItem>
+                                            <SelectItem value="yolov8n.pt">YOLOv8 Nano (3.2M params, fastest)</SelectItem>
+                                            <SelectItem value="yolov8s.pt">YOLOv8 Small (11.2M params)</SelectItem>
+                                            <SelectItem value="yolov8m.pt">YOLOv8 Medium (25.9M params)</SelectItem>
+                                            <SelectItem value="yolov8l.pt">YOLOv8 Large (43.7M params, most accurate)</SelectItem>
                                             <SelectItem value="yolov9c.pt">YOLOv9 Compact</SelectItem>
                                             <SelectItem value="yolov9e.pt">YOLOv9 Extended</SelectItem>
                                             <SelectItem value="yolov10n.pt">YOLOv10 Nano</SelectItem>
@@ -121,23 +465,27 @@ export default function ProjectTrain({ dataset, onTrainingStarted }) {
                                     <Label>Epochs</Label>
                                     <Input
                                         type="number"
+                                        min={1}
+                                        max={1000}
                                         value={config.epochs}
-                                        onChange={e => setConfig({ ...config, epochs: parseInt(e.target.value) })}
+                                        onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v) && v >= 1) { setConfig({ ...config, epochs: v }); setActivePreset(null); } }}
                                     />
                                 </div>
                                 <div className="space-y-2">
                                     <Label>Batch Size</Label>
                                     <Input
                                         type="number"
+                                        min={1}
+                                        max={128}
                                         value={config.batch_size}
-                                        onChange={e => setConfig({ ...config, batch_size: parseInt(e.target.value) })}
+                                        onChange={e => { const v = parseInt(e.target.value); if (!isNaN(v) && v >= 1) { setConfig({ ...config, batch_size: v }); setActivePreset(null); } }}
                                     />
                                 </div>
                                 <div className="space-y-2">
                                     <Label>Image Size</Label>
                                     <Select
                                         value={config.img_size.toString()}
-                                        onValueChange={v => setConfig({ ...config, img_size: parseInt(v) })}
+                                        onValueChange={v => { setConfig({ ...config, img_size: parseInt(v) }); setActivePreset(null); }}
                                     >
                                         <SelectTrigger>
                                             <SelectValue />
@@ -185,11 +533,9 @@ export default function ProjectTrain({ dataset, onTrainingStarted }) {
                             )}
                             <p className="text-muted-foreground text-xs mt-4">
                                 {selectedClasses.length} of {dataset.classes?.length} classes selected.
-                                Backend will create a temporary filtered dataset for this training job.
                             </p>
                         </CardContent>
                     </Card>
-                    {/* Jobs dashboard moved to ProjectVersions.js */}
                 </div>
 
                 <div className="space-y-6">
@@ -209,19 +555,53 @@ export default function ProjectTrain({ dataset, onTrainingStarted }) {
                                     </span>
                                     <span>~{(config.epochs * 0.5 * (selectedClasses.length / (dataset.classes?.length || 1))).toFixed(1)} mins</span>
                                 </div>
+                                {activePreset && (
+                                    <div className="flex justify-between">
+                                        <span className="text-muted-foreground">Preset</span>
+                                        <Badge variant="outline" className="text-xs">{PRESET_META[activePreset]?.label}</Badge>
+                                    </div>
+                                )}
+                                {preflight && (
+                                    <div className="flex justify-between">
+                                        <span className="text-muted-foreground">Quality</span>
+                                        <Badge variant={preflight.quality_score >= 70 ? "default" : "destructive"} className="text-xs">
+                                            {preflight.quality_score}/100
+                                        </Badge>
+                                    </div>
+                                )}
+                                {queueStatus && (
+                                    <div className="flex justify-between">
+                                        <span className="text-muted-foreground flex items-center gap-2">
+                                            <ListOrdered className="w-4 h-4" /> Queue
+                                        </span>
+                                        <span className={`text-xs font-medium ${queueStatus.slots_available > 0 ? "text-emerald-500" : "text-amber-500"}`}>
+                                            {queueStatus.slots_available > 0
+                                                ? `${queueStatus.slots_available} slot${queueStatus.slots_available > 1 ? "s" : ""} free`
+                                                : `${queueStatus.pending} waiting`}
+                                        </span>
+                                    </div>
+                                )}
                             </div>
 
                             <Button
                                 className="w-full mt-6"
                                 onClick={startTraining}
-                                disabled={training || selectedClasses.length === 0}
+                                disabled={training || selectedClasses.length === 0 || (selectedVersionIds.length === 0) || (preflight && !preflight.can_train)}
                             >
                                 {training ? "Starting..." : "Start Training"}
                                 {!training && <Play className="ml-2" />}
                             </Button>
+                            {preflight && !preflight.can_train && (
+                                <p className="text-destructive text-xs mt-2 text-center">Fix blocking issues above before training</p>
+                            )}
                         </CardContent>
                     </Card>
                 </div>
+            </div>
+
+            {/* Model Registry & Jobs */}
+            <div className="mt-8">
+                <ProjectVersions dataset={dataset} onDeploy={onDeploy} />
             </div>
         </div>
     );

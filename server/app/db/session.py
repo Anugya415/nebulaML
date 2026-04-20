@@ -52,6 +52,30 @@ def get_db_connection():
         return None
 
 
+def migrate_users_otp_columns(connection) -> None:
+    """
+    Older deployments may have `users` without OTP columns; CREATE TABLE IF NOT EXISTS
+    does not add new columns. Login/verify UPDATE those columns and would fail with 500.
+    """
+    try:
+        cur = connection.cursor()
+        cur.execute("SHOW COLUMNS FROM users LIKE 'verification_code'")
+        if not cur.fetchone():
+            cur.execute("ALTER TABLE users ADD COLUMN verification_code VARCHAR(32) NULL")
+            logger.info("Migrated: added users.verification_code")
+        cur.execute("SHOW COLUMNS FROM users LIKE 'verification_code_expires'")
+        if not cur.fetchone():
+            cur.execute(
+                "ALTER TABLE users ADD COLUMN verification_code_expires TIMESTAMP NULL"
+            )
+            logger.info("Migrated: added users.verification_code_expires")
+        connection.commit()
+        cur.close()
+    except Error as e:
+        logger.error(f"migrate_users_otp_columns: {e}")
+        raise
+
+
 def create_tables():
     """Create all required tables"""
     connection = get_db_connection()
@@ -82,6 +106,22 @@ def create_tables():
             )
         """)
         logger.info("✓ Table 'users' ready")
+        migrate_users_otp_columns(connection)
+        
+        # Pending registrations table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS pending_registrations (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                username VARCHAR(255) NOT NULL,
+                email VARCHAR(255) UNIQUE NOT NULL,
+                role ENUM('admin', 'user', 'viewer') DEFAULT 'user',
+                verification_code VARCHAR(6),
+                verification_code_expires TIMESTAMP NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                INDEX idx_email (email)
+            )
+        """)
+        logger.info("✓ Table 'pending_registrations' ready")
         
         # Datasets table
         cursor.execute("""
@@ -258,11 +298,106 @@ def create_tables():
             )
         """)
         logger.info("✓ Table 'system_logs' ready")
+        # Project members table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS project_members (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                dataset_id VARCHAR(255) NOT NULL,
+                user_id INT NOT NULL,
+                role ENUM('admin', 'annotator', 'viewer') DEFAULT 'annotator',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE KEY unique_membership (dataset_id, user_id)
+            )
+        """)
+        logger.info("✓ Table 'project_members' ready")
         
+        # Activity logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS activity_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                dataset_id VARCHAR(255) NOT NULL,
+                user_id INT,
+                action VARCHAR(255) NOT NULL,
+                details JSON,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE SET NULL,
+                INDEX idx_dataset_id (dataset_id),
+                INDEX idx_created_at (created_at)
+            )
+        """)
+        logger.info("✓ Table 'activity_logs' ready")
+
+        # Dataset quality snapshots table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS dataset_quality_snapshots (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                dataset_id VARCHAR(255) NOT NULL,
+                overall_quality_score FLOAT NOT NULL,
+                class_balance_score FLOAT NOT NULL,
+                label_accuracy_score FLOAT NOT NULL,
+                iou_consistency_score FLOAT NOT NULL,
+                total_images INT NOT NULL,
+                annotated_images INT NOT NULL,
+                duplicate_count INT DEFAULT 0,
+                near_duplicate_count INT DEFAULT 0,
+                corrupt_count INT DEFAULT 0,
+                blurry_count INT DEFAULT 0,
+                full_snapshot JSON NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                INDEX idx_quality_dataset_id (dataset_id),
+                INDEX idx_quality_created_at (created_at)
+            )
+        """)
+        logger.info("✓ Table 'dataset_quality_snapshots' ready")
+
+        # Monitoring inference logs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS monitoring_logs (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                dataset_id VARCHAR(255) NOT NULL,
+                model_job_id VARCHAR(255),
+                model_name VARCHAR(255),
+                image_name VARCHAR(255) NOT NULL,
+                num_detections INT DEFAULT 0,
+                confidence_scores JSON,
+                avg_confidence FLOAT DEFAULT 0,
+                class_counts JSON,
+                inference_time_ms FLOAT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                INDEX idx_monitoring_dataset_id (dataset_id),
+                INDEX idx_monitoring_created_at (created_at)
+            )
+        """)
+        logger.info("✓ Table 'monitoring_logs' ready")
+
+        # Active learning uncertain images table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS uncertain_images (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                dataset_id VARCHAR(255) NOT NULL,
+                image_id VARCHAR(255) NOT NULL,
+                filename VARCHAR(255) NOT NULL,
+                low_confidence_detections JSON,
+                high_confidence_detections JSON,
+                total_detections INT DEFAULT 0,
+                min_confidence FLOAT DEFAULT 0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (dataset_id) REFERENCES datasets(id) ON DELETE CASCADE,
+                UNIQUE KEY unique_uncertain (dataset_id, image_id),
+                INDEX idx_uncertain_dataset_id (dataset_id)
+            )
+        """)
+        logger.info("✓ Table 'uncertain_images' ready")
+
         connection.commit()
         cursor.close()
         connection.close()
-        
+
         logger.info("✅ All tables created successfully!")
         return True
         

@@ -1,4 +1,4 @@
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -7,30 +7,42 @@ from contextlib import asynccontextmanager
 import uvicorn
 import os
 from pathlib import Path
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from slowapi.middleware import SlowAPIMiddleware
 
-from app.api.v1.endpoints import inference, training, models as model_routes, annotations, auth, annotations_analyze, smart_annotation, video, active_learning, monitoring
+from app.api.v1.endpoints import inference, training, models as model_routes, annotations, auth, annotations_analyze, smart_annotation, video, active_learning, monitoring, collaboration
 from app.db.session import initialize_database
 from app.core.config import settings
 from app.core.logging import logger
+
+# Rate limiter — keyed by client IP
+limiter = Limiter(key_func=get_remote_address, default_limits=["200/minute"])
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan event handler for startup and shutdown"""
     # Startup
-    logger.info("🚀 Starting YOLO Generator API...")
+    logger.info("🚀 Starting NebulaML API...")
     initialize_database()
     yield
     # Shutdown (if needed, add cleanup code here)
-    logger.info("👋 Shutting down YOLO Generator API...")
+    logger.info("👋 Shutting down NebulaML API...")
 
 
 app = FastAPI(
-    title="YOLO Generator API",
+    title="NebulaML API",
     description="ML Model Training and Inference Platform",
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Attach rate limiter state and error handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+app.add_middleware(SlowAPIMiddleware)
 
 # CORS configuration
 app.add_middleware(
@@ -56,11 +68,12 @@ app.include_router(smart_annotation.router, prefix="/api/smart", tags=["Smart To
 app.include_router(video.router, prefix="/api/video", tags=["Video"])
 app.include_router(active_learning.router, prefix="/api/active-learning", tags=["Active Learning"])
 app.include_router(monitoring.router, prefix="/api/monitoring", tags=["Monitoring"])
+app.include_router(collaboration.router, prefix="/api/datasets", tags=["Collaboration"])
 
 @app.get("/")
 async def root():
     return {
-        "message": "YOLO Generator API",
+        "message": "NebulaML API",
         "status": "running",
         "docs": "/docs"
     }

@@ -1,3 +1,4 @@
+import hashlib
 import os
 import json
 import uuid
@@ -31,17 +32,19 @@ class VersioningEngine:
             width, height = preprocessing["resize"].get("width", 640), preprocessing["resize"].get("height", 640)
             transforms.append(A.Resize(height=height, width=width))
             
-        # Optional Augmentations
+        # Optional Augmentations — accepts both frontend keys and legacy keys
         if augmentations.get("blur", False):
             transforms.append(A.Blur(blur_limit=3, p=0.5))
-        if augmentations.get("flip", False):
+        if augmentations.get("flipHorizontal", False) or augmentations.get("flip", False):
             transforms.append(A.HorizontalFlip(p=0.5))
+        if augmentations.get("flipVertical", False):
+            transforms.append(A.VerticalFlip(p=0.5))
         if augmentations.get("rotate", False):
             transforms.append(A.Rotate(limit=15, p=0.5))
         if augmentations.get("brightness", False):
             transforms.append(A.RandomBrightnessContrast(p=0.5))
-        if augmentations.get("noise", False):
-            transforms.append(A.GaussNoise(p=0.5))
+        if augmentations.get("grayscale", False) or augmentations.get("noise", False):
+            transforms.append(A.ToGray(p=0.5))
             
         return A.Compose(transforms, bbox_params=A.BboxParams(format='yolo', label_fields=['class_labels']))
 
@@ -55,6 +58,11 @@ class VersioningEngine:
             
         dataset = DatasetService.get_dataset(dataset_id)
         if not dataset: return None
+        
+        # Ensure there are annotated images before generating
+        annotated_images = [img for img in dataset.get('images', []) if img.get('annotated')]
+        if not annotated_images:
+            raise ValueError("No annotated images found in the dataset. Please annotate some images before generating a version.")
         
         # 1. Register Version in DB
         versions_list = DatasetVersionService.list_dataset_versions(dataset_id)
@@ -80,20 +88,28 @@ class VersioningEngine:
         pipeline = self._build_augmentation_pipeline(preprocessing, augmentations)
         images = dataset['images']
         
-        # Simple random split logic for now
-        np.random.shuffle(images)
+        # Deterministic split: seed from dataset_id so same dataset always
+        # produces the same train/val/test partition across version regenerations.
+        seed = int(hashlib.md5(dataset_id.encode()).hexdigest(), 16) % (2 ** 31)
+        rng = np.random.default_rng(seed)
+        images = list(images)
+        rng.shuffle(images)
         n_train = int(len(images) * split_ratio['train'])
         n_val = int(len(images) * split_ratio['val'])
         
         splits = ['train'] * n_train + ['val'] * n_val + ['test'] * (len(images) - n_train - n_val)
         
         for img_data, split in zip(images, splits):
-            # Only process annotated images
+            # Only process images that are actually annotated
             if not img_data['annotated']: continue
                 
             orig_path = img_data['path']
             annotation = AnnotationService.get_annotation(dataset_id, img_data['id'])
             if not annotation: continue
+
+            # Skip images whose annotation has no bounding boxes — they produce empty YOLO labels
+            if not annotation.get('boxes'):
+                continue
             
             # Read image
             image = cv2.imread(orig_path)
@@ -110,17 +126,27 @@ class VersioningEngine:
                 if img_w <= 0 or img_h <= 0:
                     continue
                     
-                # Calculate normalized YOLO format coordinates
-                center_x = (box.get("x", 0) + box.get("width", 0) / 2) / img_w
-                center_y = (box.get("y", 0) + box.get("height", 0) / 2) / img_h
-                norm_width = box.get("width", 0) / img_w
-                norm_height = box.get("height", 0) / img_h
+                # First calculate min/max coordinates
+                x_min = box.get("x", 0) / img_w
+                y_min = box.get("y", 0) / img_h
+                x_max = (box.get("x", 0) + box.get("width", 0)) / img_w
+                y_max = (box.get("y", 0) + box.get("height", 0)) / img_h
                 
-                # Clamp values to valid Albumentations [0, 1] bounds, ensuring width/height > 0
-                center_x = max(0.0, min(1.0, center_x))
-                center_y = max(0.0, min(1.0, center_y))
-                norm_width = max(0.001, min(1.0, norm_width))
-                norm_height = max(0.001, min(1.0, norm_height))
+                # Clamp strict bounds [0, 1]
+                x_min = max(0.0, min(1.0, x_min))
+                y_min = max(0.0, min(1.0, y_min))
+                x_max = max(0.0, min(1.0, x_max))
+                y_max = max(0.0, min(1.0, y_max))
+                
+                # Re-calculate YOLO format
+                norm_width = x_max - x_min
+                norm_height = y_max - y_min
+                center_x = x_min + (norm_width / 2.0)
+                center_y = y_min + (norm_height / 2.0)
+                
+                # Skip invalid tiny boxes
+                if norm_width < 0.001 or norm_height < 0.001:
+                    continue
                 
                 bboxes.append([center_x, center_y, norm_width, norm_height])
                 class_labels.append(box.get('class_id', 0))
